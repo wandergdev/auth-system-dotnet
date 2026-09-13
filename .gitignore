@@ -1,0 +1,17 @@
+## .NET
+bin/
+obj/
+*.user
+
+## SQLite database (generated at runtime)
+*.db
+*.db-shm
+*.db-wal
+
+## OS
+.DS_Store
+
+## IDE
+.vs/
+.idea/
+*.suo

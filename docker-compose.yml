@@ -1,0 +1,26 @@
+# Postgres de desarrollo para AuthSystem.
+# Puerto 5434 para no chocar con un Postgres nativo en 5432 ni con otros proyectos.
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: authsystem-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: authsystem
+      POSTGRES_USER: authsystem
+      # Credencial de desarrollo local: la base solo escucha en localhost y no
+      # contiene datos reales. En despliegue, la cadena de conexion completa viene
+      # de ConnectionStrings__Default, nunca de este archivo.
+      POSTGRES_PASSWORD: authsystem_dev
+    ports:
+      - "5434:5432"
+    volumes:
+      - authsystem-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U authsystem -d authsystem"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  authsystem-pgdata:

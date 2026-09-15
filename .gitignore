@@ -3,7 +3,7 @@ bin/
 obj/
 *.user
 
-## SQLite database (generated at runtime)
+## Local database files (legacy SQLite; Postgres now runs in Docker)
 *.db
 *.db-shm
 *.db-wal

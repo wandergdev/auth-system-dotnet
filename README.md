@@ -1,12 +1,12 @@
 # Auth System (C# / .NET)
 
-Sistema de autenticación y autorización reutilizable, construido con ASP.NET Core 10, EF Core + SQLite e Identity. Incluye JWT con access + refresh tokens (rotación y revocación), roles, y verificación en dos pasos (2FA) por TOTP compatible con Google Authenticator / Authy.
+Sistema de autenticación y autorización reutilizable, construido con ASP.NET Core 10, EF Core + PostgreSQL e Identity. Incluye JWT con access + refresh tokens (rotación y revocación), roles, y verificación en dos pasos (2FA) por TOTP compatible con Google Authenticator / Authy.
 
 ## Stack
 
 - ASP.NET Core Web API (.NET 10, controllers)
 - ASP.NET Core Identity (`IdentityCore<ApplicationUser>` + roles)
-- Entity Framework Core + SQLite
+- Entity Framework Core + **PostgreSQL**
 - JWT firmado con **RS256** (RSA asimétrico), con JWKS público en `/.well-known/jwks.json`
 - Access token de corta duración + refresh token rotativo, con hash SHA-256 en base de datos
 - TOTP para 2FA (proveedor `Authenticator` de Identity, sin dependencias externas)
@@ -14,13 +14,19 @@ Sistema de autenticación y autorización reutilizable, construido con ASP.NET C
 ## Cómo correrlo
 
 ```bash
+docker compose up -d          # Postgres en localhost:5434
+
 cd src/AuthSystem.Api
 dotnet restore
 dotnet user-secrets set "Jwt:PrivateKey" \
   "$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | base64 | tr -d '\n')"
-dotnet ef database update   # crea authsystem.db y siembra roles Admin/User
+dotnet ef database update     # crea el esquema y siembra roles
 dotnet run
 ```
+
+El `docker-compose.yml` levanta PostgreSQL 17 en el puerto **5434** (para no chocar con un Postgres
+nativo en 5432 ni con otros proyectos). En despliegue, la cadena de conexión se pasa por
+`ConnectionStrings__Default` y este compose no se usa.
 
 La API queda en **`http://localhost:5073`** (perfil `http` de `launchSettings.json`). El perfil `https` levanta además `https://localhost:7185`. Con `ASPNETCORE_ENVIRONMENT=Development` se expone `/openapi/v1.json`.
 
@@ -258,10 +264,10 @@ Ventajas: los datos de negocio quedan referenciados a un id estable, el email pu
 No hay un endpoint público para auto-asignarse el rol `Admin` (a propósito: eso sería un hueco de seguridad). Para probar `admin-ping` en local, asígnalo directamente en la base de datos:
 
 ```bash
-sqlite3 src/AuthSystem.Api/authsystem.db \
-  "INSERT INTO AspNetUserRoles (UserId, RoleId)
-   SELECT u.Id, r.Id FROM AspNetUsers u, AspNetRoles r
-   WHERE u.Email = 'test@example.com' AND r.Name = 'Admin';"
+docker exec authsystem-db psql -U authsystem -d authsystem -c \
+  'INSERT INTO "AspNetUserRoles" ("UserId", "RoleId")
+   SELECT u."Id", r."Id" FROM "AspNetUsers" u, "AspNetRoles" r
+   WHERE u."Email" = '"'"'test@example.com'"'"' AND r."Name" = '"'"'Admin'"'"';'
 ```
 
 ## Limitaciones operativas
@@ -280,7 +286,6 @@ Para escalar horizontalmente haría falta:
 
 1. Mover los desafíos a un store distribuido —Redis vía `IDistributedCache`, o una tabla en la base de datos con su TTL— manteniendo la interfaz `IMfaChallengeStore` (`CreateChallenge` / `ConsumeChallenge`) para no tocar `AuthController`.
 2. Que el consumo del desafío siga siendo **atómico y de un solo uso**, para que dos instancias no puedan canjear el mismo `mfaToken` a la vez (`GETDEL` en Redis, o un `DELETE ... RETURNING` en SQL).
-3. Cambiar SQLite por un motor con acceso concurrente real (PostgreSQL, SQL Server): SQLite en un archivo local no se comparte entre instancias.
 
 Alternativa sin store compartido: firmar el `mfaToken` como un JWT de corta duración con la misma llave. Evita la infraestructura extra, pero pierde el consumo de un solo uso —cualquier instancia lo aceptaría hasta que expire— salvo que se agregue igualmente una denylist compartida.
 

@@ -21,7 +21,7 @@ var keyProvider = new JwtKeyProvider(Microsoft.Extensions.Options.Options.Create
 builder.Services.AddSingleton<IJwtKeyProvider>(keyProvider);
 
 builder.Services.AddDbContext<AppDbContext>(options =>
-    options.UseSqlite(builder.Configuration.GetConnectionString("Default")));
+    options.UseNpgsql(builder.Configuration.GetConnectionString("Default")));
 
 builder.Services
     .AddIdentityCore<ApplicationUser>(options =>

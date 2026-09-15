@@ -7,7 +7,8 @@ Sistema de autenticación y autorización reutilizable, construido con ASP.NET C
 - ASP.NET Core Web API (.NET 10, controllers)
 - ASP.NET Core Identity (`IdentityCore<ApplicationUser>` + roles)
 - Entity Framework Core + SQLite
-- JWT (access token de corta duración + refresh token rotativo, con hash SHA-256 en base de datos)
+- JWT firmado con **RS256** (RSA asimétrico), con JWKS público en `/.well-known/jwks.json`
+- Access token de corta duración + refresh token rotativo, con hash SHA-256 en base de datos
 - TOTP para 2FA (proveedor `Authenticator` de Identity, sin dependencias externas)
 
 ## Cómo correrlo
@@ -15,7 +16,8 @@ Sistema de autenticación y autorización reutilizable, construido con ASP.NET C
 ```bash
 cd src/AuthSystem.Api
 dotnet restore
-dotnet user-secrets set "Jwt:Secret" "$(openssl rand -base64 48)"   # ver "Secreto de firma (Jwt:Secret)"
+dotnet user-secrets set "Jwt:PrivateKey" \
+  "$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | base64 | tr -d '\n')"
 dotnet ef database update   # crea authsystem.db y siembra roles Admin/User
 dotnet run
 ```
@@ -24,31 +26,69 @@ La API queda en **`http://localhost:5073`** (perfil `http` de `launchSettings.js
 
 `launchSettings.json` solo aplica a `dotnet run` en local; en un despliegue el puerto lo define `ASPNETCORE_URLS` (o el host/contenedor).
 
-## Secreto de firma (`Jwt:Secret`)
+## Llaves de firma
 
-La clave con la que se firman los access tokens **nunca vive en un archivo commiteado**. No hay valor por defecto: si `Jwt:Secret` falta, o mide menos de 32 bytes, la API **falla al arrancar** con un mensaje explícito en vez de levantar con una llave insegura (HS256 exige una clave de 256 bits como mínimo).
+El servicio firma los access tokens con **RS256** (RSA, asimétrico). La clave privada la conoce solo
+este servicio; las APIs consumidoras obtienen la pública del endpoint JWKS y **solo pueden verificar,
+no emitir**. Ninguna llave vive en un archivo commiteado.
 
-Generar una llave nueva:
+Si falta la llave, o es inválida, o es más corta de lo que el algoritmo exige, la API **falla al
+arrancar** con un mensaje explícito en vez de levantar en un estado inseguro.
+
+### Generar el par de llaves
 
 ```bash
-openssl rand -base64 48
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | base64 | tr -d '\n'
 ```
 
-Configurarla en desarrollo (se guarda fuera del repo, en el secret store del usuario):
+Una sola línea, lista para pegar en user-secrets o en una variable de entorno. Se acepta también el
+PEM crudo, o el base64 del DER: las herramientas no se ponen de acuerdo (el `genpkey` de LibreSSL en
+macOS escribe PKCS#8 en PEM pero PKCS#1 en DER), así que el cargador admite las cuatro formas.
+
+Mínimo 2048 bits; una llave menor se rechaza al arrancar.
+
+### Configurar
+
+En desarrollo, fuera del repo:
 
 ```bash
 cd src/AuthSystem.Api
-dotnet user-secrets set "Jwt:Secret" "<la llave generada>"
+dotnet user-secrets set "Jwt:PrivateKey" "<la llave generada>"
 dotnet user-secrets list          # verificar
 ```
 
-Configurarla en despliegue, con la variable de entorno equivalente (el doble guion bajo es el separador de secciones de .NET):
+En despliegue, con la variable de entorno equivalente (el doble guion bajo separa secciones en .NET):
 
 ```bash
-export Jwt__Secret="<la llave generada>"
+export Jwt__PrivateKey="<la llave generada>"
 ```
 
-> **Rotar la llave invalida todos los access tokens al instante.** Como la misma llave la usan las APIs consumidoras para verificar (ver más abajo), hay que actualizarla en este servicio y en cada consumidor **en el mismo momento**. Los refresh tokens sobreviven a la rotación: están hasheados en base de datos, no firmados con esta llave, así que los clientes se recuperan con `POST /api/auth/refresh`.
+### Rotar
+
+Rotar la privada invalida todos los access tokens en circulación (≤15 min). Los refresh tokens
+sobreviven: están hasheados en base de datos, no firmados con esta llave, así que los clientes se
+recuperan solos con `POST /api/auth/refresh`.
+
+La gran ventaja sobre el esquema simétrico anterior: **no hay que tocar a los consumidores**. Publicas
+la llave nueva, ellos la recogen del JWKS por su `kid`, y nada más. Con HS256 una rotación exigía
+actualizar este servicio y cada consumidor en el mismo minuto.
+
+### `Jwt:Secret` (HS256, en retirada)
+
+La llave simétrica anterior sigue leyéndose **solo para validar** tokens emitidos antes del cambio a
+RS256, mientras `Jwt:AcceptLegacyHs256` esté en `true`. Ya no se firma nada con ella.
+
+Una vez que no pueda quedar ningún token HS256 dentro de su ventana de 15 minutos (en la práctica, al
+día siguiente del despliegue), cierra la transición:
+
+```jsonc
+// appsettings.json
+"Jwt": { "AcceptLegacyHs256": false }
+```
+
+y borra `Jwt:Secret` de user-secrets y del entorno. Hasta ese momento, cualquiera que tenga esa llave
+puede emitir tokens que este servicio aceptará — que es justamente lo que la migración a RS256 viene
+a cerrar.
 
 ## Endpoints
 
@@ -64,6 +104,8 @@ export Jwt__Secret="<la llave generada>"
 | POST | `/api/auth/2fa/disable` | Desactiva 2FA tras verificar un código válido |
 | GET | `/api/users/me` | Perfil del usuario autenticado (roles, estado de 2FA) |
 | GET | `/api/users/admin-ping` | Endpoint de ejemplo protegido por `[Authorize(Roles = "Admin")]` |
+| GET | `/.well-known/jwks.json` | **Público.** Clave pública de firma, para que los consumidores validen |
+| GET | `/.well-known/openid-configuration` | **Público.** Descubrimiento mínimo (`issuer`, `jwks_uri`) |
 
 ## Integrar una API consumidora
 
@@ -74,8 +116,10 @@ Este servicio es el único que emite tokens. Una API consumidora (por ejemplo `f
 Header:
 
 ```json
-{ "alg": "HS256", "typ": "JWT" }
+{ "alg": "RS256", "kid": "s8SWDobMqoed8cvZ8-S6ngOMbchKaty1sywz-uGODlk", "typ": "JWT" }
 ```
+
+El `kid` identifica la llave del JWKS con la que verificar. Se deriva del thumbprint de la llave (RFC 7638), así que es estable y reproducible: eso es lo que permite publicar dos llaves a la vez y rotar sin coordinar despliegues.
 
 Payload (ejemplo real, recortado):
 
@@ -116,44 +160,59 @@ Dos detalles que sorprenden si no se leen antes:
 
 No alcanza con decodificar el token. Un verificador correcto valida **las cuatro cosas**:
 
-1. **La firma**, con la misma llave `Jwt:Secret` de este servicio.
+1. **La firma**, con la clave pública que publica `/.well-known/jwks.json`.
 2. **`iss` = `AuthSystem`**.
 3. **`aud` = `AuthSystem.Clients`**.
-4. **El algoritmo, fijado explícitamente a `HS256`.**
+4. **El algoritmo, fijado explícitamente a `RS256`.**
 
-El punto 4 no es opcional. Si la librería acepta el algoritmo que venga en el header del token, un atacante puede cambiar `alg` a `none` (token sin firma) o, en un futuro despliegue con RSA, firmar con HMAC usando la clave pública como secreto: son los **ataques de confusión de algoritmo**. Fijar la lista de algoritmos permitidos los cierra.
+El punto 4 no es opcional. Si la librería acepta el algoritmo que venga en el header del token, un atacante puede cambiar `alg` a `none` (token sin firma) o firmar con HMAC usando la **clave pública como secreto** — y como ahora esa clave es, por diseño, pública, el ataque está al alcance de cualquiera. Son los **ataques de confusión de algoritmo**. Fijar la lista de algoritmos permitidos los cierra; este servicio los rechaza y el consumidor debe hacer lo mismo.
 
 Este servicio valida la expiración con un margen (`ClockSkew`) de 30 segundos; conviene que el consumidor use un margen parecido en vez del default de 5 minutos de muchas librerías.
 
-En Node/Express (`jsonwebtoken`):
+En Node/Express (`jsonwebtoken` + `jwks-rsa`):
 
 ```js
 const jwt = require("jsonwebtoken");
+const jwksClient = require("jwks-rsa");
 
 const ROLE_CLAIM = "http://schemas.microsoft.com/ws/2008/06/identity/claims/role";
+
+const client = jwksClient({
+  jwksUri: `${process.env.AUTH_SERVICE_URL}/.well-known/jwks.json`,
+  cache: true,               // no golpear el auth en cada request
+  cacheMaxAge: 3600_000,
+  rateLimit: true,
+});
+
+// Resolver la llave por el kid del header: nunca probar llaves "a ver cuál pega".
+const getKey = (header, cb) =>
+  client.getSigningKey(header.kid, (err, key) =>
+    cb(err, key && key.getPublicKey()));
 
 function authenticate(req, res, next) {
   const [scheme, token] = (req.headers.authorization || "").split(" ");
   if (scheme !== "Bearer" || !token) return res.sendStatus(401);
 
-  try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET, {
-      algorithms: ["HS256"],          // obligatorio: cierra la confusión de algoritmo
-      issuer: "AuthSystem",
-      audience: "AuthSystem.Clients",
-      clockTolerance: 30,
-    });
-
+  jwt.verify(token, getKey, {
+    algorithms: ["RS256"],          // obligatorio: cierra la confusión de algoritmo
+    issuer: "AuthSystem",
+    audience: "AuthSystem.Clients",
+    clockTolerance: 30,
+  }, (err, payload) => {
+    if (err) return res.sendStatus(401);
     const roles = [].concat(payload[ROLE_CLAIM] ?? []);   // string o array
     req.user = { id: payload.sub, email: payload.email, roles };
     next();
-  } catch {
-    res.sendStatus(401);
-  }
+  });
 }
 ```
 
-En otra API .NET, el equivalente es `AddJwtBearer` con `ValidateIssuer`, `ValidateAudience`, `ValidateIssuerSigningKey` y `ValidAlgorithms = [SecurityAlgorithms.HmacSha256]`.
+> **Durante la migración**, si necesitas aceptar los dos algoritmos a la vez, pasa
+> `algorithms: ["RS256", "HS256"]` **y resuelve la llave según `header.alg`**: la pública solo para
+> `RS256`, el secreto HMAC solo para `HS256`. Si dejas que la librería pruebe ambas contra el mismo
+> material, reabres exactamente el ataque que el punto 4 cierra. Quita `HS256` en cuanto puedas.
+
+En otra API .NET basta con apuntar al issuer: `AddJwtBearer(o => { o.Authority = authUrl; o.Audience = "AuthSystem.Clients"; o.TokenValidationParameters.ValidAlgorithms = [SecurityAlgorithms.RsaSha256]; })` — descubre el JWKS por `/.well-known/openid-configuration` y no hay que configurar llaves a mano.
 
 ### Ciclo de vida del token en el cliente
 
@@ -229,10 +288,11 @@ Alternativa sin store compartido: firmar el `mfaToken` como un JWT de corta dura
 
 ```
 src/AuthSystem.Api/
-  Controllers/      AuthController, UsersController
+  Controllers/      AuthController, UsersController, WellKnownController (JWKS)
   Data/              AppDbContext, RoleSeeder, migraciones EF
   Dtos/              Contratos de request/response
   Models/            ApplicationUser, RefreshToken
   Options/           JwtOptions
-  Services/          TokenService (JWT + refresh), MfaChallengeStore (desafíos 2FA pendientes)
+  Services/          TokenService (JWT + refresh), JwtKeyProvider (llaves de firma + JWKS),
+                     MfaChallengeStore (desafíos 2FA pendientes)
 ```

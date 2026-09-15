@@ -1,4 +1,3 @@
-using System.Text;
 using AuthSystem.Api.Data;
 using AuthSystem.Api.Models;
 using AuthSystem.Api.Options;
@@ -14,25 +13,12 @@ builder.Services.Configure<JwtOptions>(builder.Configuration.GetSection(JwtOptio
 var jwtOptions = builder.Configuration.GetSection(JwtOptions.SectionName).Get<JwtOptions>()
     ?? throw new InvalidOperationException("Missing 'Jwt' configuration section.");
 
-// The signing key never lives in a committed file: it comes from user-secrets in
-// development and from the Jwt__Secret environment variable everywhere else. Fail
-// fast and loudly instead of falling back to anything insecure.
-if (string.IsNullOrWhiteSpace(jwtOptions.Secret))
-{
-    throw new InvalidOperationException(
-        "Jwt:Secret is not configured. The API refuses to start without a signing key. " +
-        "Local development: run 'dotnet user-secrets set \"Jwt:Secret\" \"<key>\"' from src/AuthSystem.Api. " +
-        "Deployment: set the Jwt__Secret environment variable. " +
-        "Generate a key with: openssl rand -base64 48");
-}
-
-var signingKeyBytes = Encoding.UTF8.GetBytes(jwtOptions.Secret);
-if (signingKeyBytes.Length < 32)
-{
-    throw new InvalidOperationException(
-        $"Jwt:Secret is too short: {signingKeyBytes.Length} bytes. HS256 requires a key of at least " +
-        "32 bytes (256 bits). Generate one with: openssl rand -base64 48");
-}
+// Signing keys never live in a committed file: they come from user-secrets in
+// development and from Jwt__PrivateKey / Jwt__Secret everywhere else. The provider
+// validates the key material and throws with an actionable message, so a missing or
+// weak key stops startup instead of silently producing forgeable tokens.
+var keyProvider = new JwtKeyProvider(Microsoft.Extensions.Options.Options.Create(jwtOptions));
+builder.Services.AddSingleton<IJwtKeyProvider>(keyProvider);
 
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlite(builder.Configuration.GetConnectionString("Default")));
@@ -64,7 +50,11 @@ builder.Services
             ValidateAudience = true,
             ValidAudience = jwtOptions.Audience,
             ValidateIssuerSigningKey = true,
-            IssuerSigningKey = new SymmetricSecurityKey(signingKeyBytes),
+            IssuerSigningKeys = keyProvider.ValidationKeys,
+            // Pinning the algorithms is what closes algorithm confusion: without this the
+            // token's own header decides how it gets verified, so 'alg: none' or an HMAC
+            // signature computed over the RSA public key would be accepted.
+            ValidAlgorithms = keyProvider.ValidAlgorithms,
             ValidateLifetime = true,
             ClockSkew = TimeSpan.FromSeconds(30),
         };

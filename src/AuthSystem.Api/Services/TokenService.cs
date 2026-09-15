@@ -9,7 +9,7 @@ using Microsoft.IdentityModel.Tokens;
 
 namespace AuthSystem.Api.Services;
 
-public class TokenService(IOptions<JwtOptions> jwtOptions) : ITokenService
+public class TokenService(IOptions<JwtOptions> jwtOptions, IJwtKeyProvider keyProvider) : ITokenService
 {
     private readonly JwtOptions _options = jwtOptions.Value;
 
@@ -30,15 +30,15 @@ public class TokenService(IOptions<JwtOptions> jwtOptions) : ITokenService
         };
         claims.AddRange(roles.Select(role => new Claim(ClaimTypes.Role, role)));
 
-        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_options.Secret));
-        var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
-
+        // Signing material comes from the key provider, which also stamps the header's
+        // kid. Consumers use that kid to pick the right key out of the JWKS, which is
+        // what lets a key be rotated without coordinating a deploy on both sides.
         var token = new JwtSecurityToken(
             issuer: _options.Issuer,
             audience: _options.Audience,
             claims: claims,
             expires: expiresAtUtc,
-            signingCredentials: credentials
+            signingCredentials: keyProvider.SigningCredentials
         );
 
         return (new JwtSecurityTokenHandler().WriteToken(token), expiresAtUtc);

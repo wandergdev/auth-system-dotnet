@@ -5,6 +5,7 @@ using AuthSystem.Api.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -30,7 +31,7 @@ builder.Services
         options.Password.RequiredLength = 8;
         options.Password.RequireNonAlphanumeric = false;
     })
-    .AddRoles<IdentityRole<Guid>>()
+    .AddRoles<ApplicationRole>()
     .AddEntityFrameworkStores<AppDbContext>()
     .AddSignInManager()
     .AddDefaultTokenProviders();
@@ -48,7 +49,6 @@ builder.Services
             ValidateIssuer = true,
             ValidIssuer = jwtOptions.Issuer,
             ValidateAudience = true,
-            ValidAudience = jwtOptions.Audience,
             ValidateIssuerSigningKey = true,
             IssuerSigningKeys = keyProvider.ValidationKeys,
             // Pinning the algorithms is what closes algorithm confusion: without this the
@@ -60,10 +60,29 @@ builder.Services
         };
     });
 
+// The audience validator needs the application registry, which needs the database, so
+// it is wired here rather than inline above: Configure<T> resolves the dependency from
+// the container once the provider exists, with no second provider built by hand.
+builder.Services
+    .AddOptions<JwtBearerOptions>(JwtBearerDefaults.AuthenticationScheme)
+    .Configure<IClientApplicationService>((options, registry) =>
+    {
+        // Audiences come from the client application registry, not from config: a new
+        // consumer is registered once in the database and every instance accepts it
+        // without a redeploy. The token still has to name exactly one of them, so a
+        // token minted for one application is rejected by all the others.
+        options.TokenValidationParameters.AudienceValidator = (audiences, _, _) =>
+            audiences is not null
+            && audiences.Any(a => registry.GetActiveAudiences().Contains(a, StringComparer.Ordinal));
+    });
+
 builder.Services.AddAuthorization();
 builder.Services.AddMemoryCache();
 builder.Services.AddScoped<ITokenService, TokenService>();
-builder.Services.AddSingleton<IMfaChallengeStore, MfaChallengeStore>();
+// Scoped, not singleton: the challenge store now writes to the database, so every
+// instance sees the same pending challenges and the service can be load balanced.
+builder.Services.AddScoped<IMfaChallengeStore, DbMfaChallengeStore>();
+builder.Services.AddSingleton<IClientApplicationService, ClientApplicationService>();
 
 builder.Services.AddControllers();
 builder.Services.AddOpenApi();
@@ -74,7 +93,11 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
     await db.Database.MigrateAsync();
-    await RoleSeeder.SeedAsync(scope.ServiceProvider);
+    await DataSeeder.SeedAsync(scope.ServiceProvider);
+
+    // Load the audience snapshot before the first request, so nothing is validated
+    // against an empty list.
+    await scope.ServiceProvider.GetRequiredService<IClientApplicationService>().RefreshAsync();
 }
 
 if (app.Environment.IsDevelopment())

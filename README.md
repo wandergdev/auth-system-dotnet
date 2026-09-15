@@ -69,15 +69,28 @@ En despliegue, con la variable de entorno equivalente (el doble guion bajo separ
 export Jwt__PrivateKey="<la llave generada>"
 ```
 
-### Rotar
+### Rotar sin downtime
 
-Rotar la privada invalida todos los access tokens en circulación (≤15 min). Los refresh tokens
-sobreviven: están hasheados en base de datos, no firmados con esta llave, así que los clientes se
-recuperan solos con `POST /api/auth/refresh`.
+La rotación no requiere tocar a los consumidores ni coordinar despliegues: publicas la llave nueva y
+ellos la recogen del JWKS por su `kid`.
 
-La gran ventaja sobre el esquema simétrico anterior: **no hay que tocar a los consumidores**. Publicas
-la llave nueva, ellos la recogen del JWKS por su `kid`, y nada más. Con HS256 una rotación exigía
-actualizar este servicio y cada consumidor en el mismo minuto.
+Para que además sea **sin corte**, durante la ventana de rotación se publican las dos llaves:
+
+```bash
+# 1. exportar la pública de la llave que sale
+openssl pkey -pubout -in llave-actual.pem | base64 | tr -d '\n'   # -> Jwt__PreviousPublicKey
+
+# 2. generar la nueva
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | base64 | tr -d '\n'  # -> Jwt__PrivateKey
+
+# 3. desplegar con las dos. Pasados >15 min, quitar Jwt__PreviousPublicKey.
+```
+
+Durante esa ventana el JWKS expone ambas llaves, los tokens firmados con la saliente siguen validando
+hasta expirar, y los consumidores que aún tengan el JWKS anterior en caché siguen funcionando. La
+llave saliente solo se usa para **validar**: nunca vuelve a firmar.
+
+Los refresh tokens son ajenos a todo esto: están hasheados en base de datos, no firmados.
 
 ### `Jwt:Secret` (HS256, en retirada)
 
@@ -110,7 +123,10 @@ a cerrar.
 | POST | `/api/auth/2fa/disable` | Desactiva 2FA tras verificar un código válido |
 | GET | `/api/users/me` | Perfil del usuario autenticado (roles, estado de 2FA) |
 | GET | `/api/users/admin-ping` | Endpoint de ejemplo protegido por `[Authorize(Roles = "Admin")]` |
-| GET | `/.well-known/jwks.json` | **Público.** Clave pública de firma, para que los consumidores validen |
+| GET | `/api/applications` | Lista las aplicaciones registradas (rol `Admin`) |
+| POST | `/api/applications` | Registra una aplicación consumidora con su audiencia (rol `Admin`) |
+| POST | `/api/applications/{clientId}/deactivate` | Desactiva una aplicación (rol `Admin`) |
+| GET | `/.well-known/jwks.json` | **Público.** Clave(s) pública(s) de firma, para que los consumidores validen |
 | GET | `/.well-known/openid-configuration` | **Público.** Descubrimiento mínimo (`issuer`, `jwks_uri`) |
 
 ## Integrar una API consumidora
@@ -249,6 +265,57 @@ CREATE TABLE users (
 
 Ventajas: los datos de negocio quedan referenciados a un id estable, el email puede cambiar sin romper nada, y no hay una segunda copia de credenciales que mantener sincronizada ni que se pueda filtrar.
 
+## Varias aplicaciones consumidoras
+
+Cada aplicación consumidora se registra una vez y recibe **su propia audiencia**. Un token emitido
+para el CRM es rechazado por finance-api y viceversa: si la app menos cuidadosa filtra un token, ese
+token no abre las demás.
+
+### Registrar una aplicación
+
+```bash
+curl -X POST http://localhost:5073/api/applications \
+  -H "Authorization: Bearer <token de un Admin>" \
+  -H "Content-Type: application/json" \
+  -d '{"clientId":"crm-app","audience":"crm.myorg.app","displayName":"CRM"}'
+```
+
+Se crean automáticamente sus roles `Admin` y `User`. El registro exige rol `Admin`: decidir qué
+audiencias emite este servicio no es algo que pueda hacer un usuario cualquiera.
+
+`POST /api/applications/{clientId}/deactivate` la desactiva — deja de emitir tokens y los existentes
+fallan la validación de audiencia, sin borrar roles ni asignaciones.
+
+### Pedir un token para una aplicación
+
+```jsonc
+POST /api/auth/login
+{ "email": "...", "password": "...", "clientId": "crm-app" }   // -> aud: "crm.myorg.app"
+```
+
+**`clientId` es opcional.** Si se omite, se usa la aplicación `default`, cuya audiencia es
+`AuthSystem.Clients` — exactamente la que validaban los consumidores anteriores, así que no hubo que
+cambiar nada en ellos.
+
+### Roles por aplicación
+
+Un rol pertenece a una aplicación: puedes ser `Admin` en el CRM y `User` en finance. En la base de
+datos se guardan cualificados (`crm-app:Admin`) porque Identity exige nombres de rol únicos, pero el
+token lleva solo el nombre simple:
+
+```jsonc
+// token para crm-app          // token para default
+"...claims/role": "Admin"      "...claims/role": "User"
+```
+
+El consumidor no ve el prefijo y no tiene que saber que existe.
+
+### Añadir la aplicación número 100
+
+No toca este repositorio. Se registra por API, las audiencias se recargan solas en todas las
+instancias (caché de 60 s) y el consumidor nuevo solo necesita la URL del servicio para leer el JWKS.
+No se reparte ningún secreto.
+
 ## Probar 2FA de punta a punta
 
 1. `POST /api/auth/2fa/setup` (con el access token en `Authorization: Bearer`) → devuelve `sharedKey` y `authenticatorUri`.
@@ -267,37 +334,42 @@ No hay un endpoint público para auto-asignarse el rol `Admin` (a propósito: es
 docker exec authsystem-db psql -U authsystem -d authsystem -c \
   'INSERT INTO "AspNetUserRoles" ("UserId", "RoleId")
    SELECT u."Id", r."Id" FROM "AspNetUsers" u, "AspNetRoles" r
-   WHERE u."Email" = '"'"'test@example.com'"'"' AND r."Name" = '"'"'Admin'"'"';'
+   WHERE u."Email" = '"'"'test@example.com'"'"' AND r."Name" = '"'"'default:Admin'"'"';'
+
+El nombre del rol va cualificado (`default:Admin`) porque los roles pertenecen a una aplicación.
 ```
 
-## Limitaciones operativas
+## Escalado horizontal
 
-### El servicio es single-instance hoy
+El servicio **puede correr en varias instancias detrás de un balanceador**. Todo el estado compartido
+vive en PostgreSQL:
 
-`Services/MfaChallengeStore.cs` guarda los desafíos de 2FA pendientes (el `mfaToken` que devuelve `/api/auth/login` y que consume `/api/auth/login/2fa`) en `IMemoryCache`, es decir **en la memoria del proceso**.
+- **Usuarios, roles, aplicaciones y refresh tokens**: en base de datos desde siempre.
+- **Desafíos 2FA pendientes** (`MfaChallenges`): antes en `IMemoryCache`, lo que obligaba a una sola
+  instancia — un `login` atendido por la instancia A y un `login/2fa` que cayera en la B fallaba con
+  401. Ahora están en base de datos y los canjea cualquier instancia.
+- El canje es **atómico y de un solo uso**: un `DELETE ... RETURNING` resuelve la lectura y el borrado
+  en una sola sentencia, así que dos instancias compitiendo por el mismo `mfaToken` no pueden
+  canjearlo las dos. Verificado con 20 intentos concurrentes: exactamente uno gana.
+- **Las audiencias se recargan solas**: cada instancia mantiene un snapshot en memoria que refresca
+  cada 60 s, así que registrar una aplicación se propaga sin reiniciar ni coordinar nada.
 
-Consecuencia concreta: si corren dos instancias detrás de un balanceador, un usuario con 2FA puede hacer `login` contra la instancia A y que su `login/2fa` caiga en la instancia B, que no conoce ese `mfaToken` y responde `401`. El login con 2FA fallaría de forma intermitente, dependiendo del balanceo.
+Lo único por instancia es ese snapshot de audiencias, y es una caché: reconstruirlo es una consulta.
 
-Por eso, **mientras el store sea en memoria, este servicio debe desplegarse en una sola instancia.** Lo mismo aplica a reinicios: un deploy invalida los desafíos en vuelo (con un TTL de 5 minutos, la ventana es corta y el usuario solo tiene que volver a hacer login).
-
-El resto del estado ya es compartible: usuarios, roles y refresh tokens viven en la base de datos, no en memoria.
-
-Para escalar horizontalmente haría falta:
-
-1. Mover los desafíos a un store distribuido —Redis vía `IDistributedCache`, o una tabla en la base de datos con su TTL— manteniendo la interfaz `IMfaChallengeStore` (`CreateChallenge` / `ConsumeChallenge`) para no tocar `AuthController`.
-2. Que el consumo del desafío siga siendo **atómico y de un solo uso**, para que dos instancias no puedan canjear el mismo `mfaToken` a la vez (`GETDEL` en Redis, o un `DELETE ... RETURNING` en SQL).
-
-Alternativa sin store compartido: firmar el `mfaToken` como un JWT de corta duración con la misma llave. Evita la infraestructura extra, pero pierde el consumo de un solo uso —cualquier instancia lo aceptaría hasta que expire— salvo que se agregue igualmente una denylist compartida.
+Los desafíos pendientes caducan solos (TTL de 5 minutos) y quedan inutilizables aunque no se borren;
+`DbMfaChallengeStore.RemoveExpiredAsync` limpia la tabla cuando se quiera programar.
 
 ## Estructura
 
 ```
 src/AuthSystem.Api/
-  Controllers/      AuthController, UsersController, WellKnownController (JWKS)
-  Data/              AppDbContext, RoleSeeder, migraciones EF
+  Controllers/      AuthController, UsersController, ClientApplicationsController,
+                     WellKnownController (JWKS)
+  Data/              AppDbContext, DataSeeder, migraciones EF
   Dtos/              Contratos de request/response
-  Models/            ApplicationUser, RefreshToken
+  Models/            ApplicationUser, ApplicationRole, ClientApplication,
+                     RefreshToken, MfaChallenge
   Options/           JwtOptions
   Services/          TokenService (JWT + refresh), JwtKeyProvider (llaves de firma + JWKS),
-                     MfaChallengeStore (desafíos 2FA pendientes)
+                     ClientApplicationService (registro de apps), DbMfaChallengeStore
 ```

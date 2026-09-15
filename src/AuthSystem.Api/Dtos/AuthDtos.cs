@@ -2,14 +2,19 @@ using System.ComponentModel.DataAnnotations;
 
 namespace AuthSystem.Api.Dtos;
 
+/// ClientId is optional on every request that takes one: omitting it falls back to the
+/// default application, so clients written before applications were modelled keep
+/// working unchanged.
 public record RegisterRequest(
     [Required, EmailAddress] string Email,
-    [Required, MinLength(8)] string Password
+    [Required, MinLength(8)] string Password,
+    string? ClientId = null
 );
 
 public record LoginRequest(
     [Required, EmailAddress] string Email,
-    [Required] string Password
+    [Required] string Password,
+    string? ClientId = null
 );
 
 public record TwoFactorLoginRequest(
@@ -36,3 +41,11 @@ public record LoginResponse(bool RequiresTwoFactor, string? MfaToken, TokenRespo
 public record TwoFactorSetupResponse(string SharedKey, string AuthenticatorUri);
 
 public record UserResponse(Guid Id, string Email, bool TwoFactorEnabled, IList<string> Roles);
+
+public record ClientApplicationResponse(string ClientId, string Audience, string DisplayName, bool IsActive);
+
+public record CreateClientApplicationRequest(
+    [Required, StringLength(128, MinimumLength = 2)] string ClientId,
+    [Required, StringLength(256, MinimumLength = 1)] string Audience,
+    [Required, StringLength(256, MinimumLength = 1)] string DisplayName
+);

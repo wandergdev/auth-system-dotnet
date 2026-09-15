@@ -20,6 +20,8 @@ public sealed class JwtKeyProvider : IJwtKeyProvider, IDisposable
     public const int MinimumRsaKeySizeBits = 2048;
 
     private readonly RSA? _rsa;
+    private readonly RSA? _previousRsa;
+    private readonly RsaSecurityKey? _previousRsaKey;
 
     public SigningCredentials SigningCredentials { get; }
     public IReadOnlyList<SecurityKey> ValidationKeys { get; }
@@ -51,6 +53,16 @@ public sealed class JwtKeyProvider : IJwtKeyProvider, IDisposable
 
             validationKeys.Add(_rsaKey);
             validAlgorithms.Add(SecurityAlgorithms.RsaSha256);
+
+            // Rotation window: the outgoing public key keeps validating tokens it signed
+            // and stays in the JWKS, so neither in-flight tokens nor consumers holding a
+            // cached JWKS break while the new key propagates.
+            if (!string.IsNullOrWhiteSpace(jwt.PreviousPublicKey))
+            {
+                _previousRsa = LoadRsaPublicKey(jwt.PreviousPublicKey);
+                _previousRsaKey = new RsaSecurityKey(_previousRsa) { KeyId = ComputeRsaThumbprint(_previousRsa) };
+                validationKeys.Add(_previousRsaKey);
+            }
 
             // Transition window: tokens signed with the old symmetric key stay valid until
             // they expire, so a deploy does not log every current session out. Turn
@@ -92,7 +104,19 @@ public sealed class JwtKeyProvider : IJwtKeyProvider, IDisposable
             N: Base64UrlEncoder.Encode(parameters.Modulus!),
             E: Base64UrlEncoder.Encode(parameters.Exponent!));
 
-        return new JwksDocument([key]);
+        var keys = new List<JsonWebKeyDto> { key };
+
+        if (_previousRsaKey is not null && _previousRsa is not null)
+        {
+            var previous = _previousRsa.ExportParameters(includePrivateParameters: false);
+            keys.Add(new JsonWebKeyDto(
+                Kty: "RSA", Use: "sig", Alg: SecurityAlgorithms.RsaSha256,
+                Kid: _previousRsaKey.KeyId,
+                N: Base64UrlEncoder.Encode(previous.Modulus!),
+                E: Base64UrlEncoder.Encode(previous.Exponent!)));
+        }
+
+        return new JwksDocument(keys);
     }
 
     /// Accepts "RS256"/"HS256" in any casing, and the full URI form the IdentityModel
@@ -197,6 +221,36 @@ public sealed class JwtKeyProvider : IJwtKeyProvider, IDisposable
         return rsa;
     }
 
+    /// Loads the retiring key. Only the public half is needed: it validates old tokens
+    /// but must never sign anything.
+    private static RSA LoadRsaPublicKey(string material)
+    {
+        var trimmed = material.Trim();
+        var rsa = RSA.Create();
+
+        try
+        {
+            if (TryGetPem(trimmed, out var pem))
+            {
+                rsa.ImportFromPem(pem);
+            }
+            else
+            {
+                rsa.ImportSubjectPublicKeyInfo(Convert.FromBase64String(trimmed), out _);
+            }
+        }
+        catch (Exception ex) when (ex is CryptographicException or FormatException or ArgumentException)
+        {
+            rsa.Dispose();
+            throw new InvalidOperationException(
+                "Jwt:PreviousPublicKey could not be read. Expected an RSA public key as a PEM block " +
+                "('-----BEGIN PUBLIC KEY-----'), or the base64 of that PEM, or of its DER encoding. " +
+                "Export it from the retiring private key with: openssl pkey -pubout", ex);
+        }
+
+        return rsa;
+    }
+
     /// Recognises a PEM block given directly, or one that was base64-encoded a second
     /// time to survive as a single-line environment variable.
     private static bool TryGetPem(string material, out string pem)
@@ -241,5 +295,9 @@ public sealed class JwtKeyProvider : IJwtKeyProvider, IDisposable
         return Base64UrlEncoder.Encode(hash);
     }
 
-    public void Dispose() => _rsa?.Dispose();
+    public void Dispose()
+    {
+        _rsa?.Dispose();
+        _previousRsa?.Dispose();
+    }
 }

@@ -13,7 +13,8 @@ public class TokenService(IOptions<JwtOptions> jwtOptions, IJwtKeyProvider keyPr
 {
     private readonly JwtOptions _options = jwtOptions.Value;
 
-    public (string AccessToken, DateTime ExpiresAtUtc) GenerateAccessToken(ApplicationUser user, IList<string> roles)
+    public (string AccessToken, DateTime ExpiresAtUtc) GenerateAccessToken(
+        ApplicationUser user, ClientApplication application, IList<string> roles)
     {
         var expiresAtUtc = DateTime.UtcNow.AddMinutes(_options.AccessTokenMinutes);
 
@@ -35,7 +36,9 @@ public class TokenService(IOptions<JwtOptions> jwtOptions, IJwtKeyProvider keyPr
         // what lets a key be rotated without coordinating a deploy on both sides.
         var token = new JwtSecurityToken(
             issuer: _options.Issuer,
-            audience: _options.Audience,
+            // Audience is the consuming application's own, not a shared one: a token
+            // minted for the CRM is rejected by finance-api and vice versa.
+            audience: application.Audience,
             claims: claims,
             expires: expiresAtUtc,
             signingCredentials: keyProvider.SigningCredentials

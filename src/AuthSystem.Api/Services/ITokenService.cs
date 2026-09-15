@@ -6,7 +6,9 @@ public record GeneratedRefreshToken(string RawToken, string Hash, DateTime Expir
 
 public interface ITokenService
 {
-    (string AccessToken, DateTime ExpiresAtUtc) GenerateAccessToken(ApplicationUser user, IList<string> roles);
+    (string AccessToken, DateTime ExpiresAtUtc) GenerateAccessToken(
+        ApplicationUser user, ClientApplication application, IList<string> roles);
+
     GeneratedRefreshToken GenerateRefreshToken();
     string HashRefreshToken(string rawToken);
 }

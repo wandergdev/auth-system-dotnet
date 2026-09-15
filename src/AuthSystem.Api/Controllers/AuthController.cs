@@ -18,6 +18,7 @@ public class AuthController(
     AppDbContext db,
     ITokenService tokenService,
     IMfaChallengeStore mfaChallengeStore,
+    IClientApplicationService clientApplications,
     IOptions<JwtOptions> jwtOptions
 ) : ControllerBase
 {
@@ -26,6 +27,12 @@ public class AuthController(
     [HttpPost("register")]
     public async Task<ActionResult<TokenResponse>> Register(RegisterRequest request)
     {
+        var app = await ResolveApplicationAsync(request.ClientId);
+        if (app is null)
+        {
+            return BadRequest(new { message = $"La aplicación '{request.ClientId}' no existe o está inactiva." });
+        }
+
         var existing = await userManager.FindByEmailAsync(request.Email);
         if (existing is not null)
         {
@@ -39,15 +46,21 @@ public class AuthController(
             return BadRequest(new { errors = result.Errors.Select(e => e.Description) });
         }
 
-        await userManager.AddToRoleAsync(user, "User");
+        await userManager.AddToRoleAsync(user, ApplicationRole.QualifiedName(app.ClientId, "User"));
 
-        var tokens = await IssueTokensAsync(user);
+        var tokens = await IssueTokensAsync(user, app);
         return CreatedAtAction(nameof(Register), tokens);
     }
 
     [HttpPost("login")]
     public async Task<ActionResult<LoginResponse>> Login(LoginRequest request)
     {
+        var app = await ResolveApplicationAsync(request.ClientId);
+        if (app is null)
+        {
+            return BadRequest(new { message = $"La aplicación '{request.ClientId}' no existe o está inactiva." });
+        }
+
         var user = await userManager.FindByEmailAsync(request.Email);
         if (user is null || !await userManager.CheckPasswordAsync(user, request.Password))
         {
@@ -56,27 +69,36 @@ public class AuthController(
 
         if (await userManager.GetTwoFactorEnabledAsync(user))
         {
-            var mfaToken = mfaChallengeStore.CreateChallenge(user.Id, TimeSpan.FromMinutes(_jwtOptions.MfaChallengeMinutes));
+            var mfaToken = await mfaChallengeStore.CreateChallengeAsync(
+                user.Id, app.Id, TimeSpan.FromMinutes(_jwtOptions.MfaChallengeMinutes));
             return Ok(new LoginResponse(true, mfaToken, null));
         }
 
-        var tokens = await IssueTokensAsync(user);
+        var tokens = await IssueTokensAsync(user, app);
         return Ok(new LoginResponse(false, null, tokens));
     }
 
     [HttpPost("login/2fa")]
     public async Task<ActionResult<TokenResponse>> LoginTwoFactor(TwoFactorLoginRequest request)
     {
-        var userId = mfaChallengeStore.ConsumeChallenge(request.MfaToken);
-        if (userId is null)
+        var challenge = await mfaChallengeStore.ConsumeChallengeAsync(request.MfaToken);
+        if (challenge is null)
         {
             return Unauthorized(new { message = "El desafío de doble factor expiró o es inválido." });
         }
 
-        var user = await userManager.FindByIdAsync(userId.Value.ToString());
+        var user = await userManager.FindByIdAsync(challenge.UserId.ToString());
         if (user is null)
         {
             return Unauthorized();
+        }
+
+        // The challenge carries the application the login started for, so the resulting
+        // token is scoped to that same app and cannot be redirected to another one.
+        var app = await db.ClientApplications.FirstOrDefaultAsync(a => a.Id == challenge.ClientApplicationId && a.IsActive);
+        if (app is null)
+        {
+            return Unauthorized(new { message = "La aplicación del desafío ya no está disponible." });
         }
 
         var isValid = await userManager.VerifyTwoFactorTokenAsync(
@@ -86,7 +108,7 @@ public class AuthController(
             return Unauthorized(new { message = "Código de verificación incorrecto." });
         }
 
-        var tokens = await IssueTokensAsync(user);
+        var tokens = await IssueTokensAsync(user, app);
         return Ok(tokens);
     }
 
@@ -103,9 +125,17 @@ public class AuthController(
             return Unauthorized(new { message = "Refresh token inválido o expirado." });
         }
 
+        var app = await db.ClientApplications.FirstOrDefaultAsync(a => a.Id == stored.ClientApplicationId && a.IsActive);
+        if (app is null)
+        {
+            return Unauthorized(new { message = "La aplicación de este refresh token ya no está disponible." });
+        }
+
         stored.RevokedAtUtc = DateTime.UtcNow;
 
-        var tokens = await IssueTokensAsync(stored.User);
+        // Refreshing stays within the application the token was issued for: a refresh
+        // token can never be exchanged for access to a different audience.
+        var tokens = await IssueTokensAsync(stored.User, app);
 
         var newHash = tokenService.HashRefreshToken(tokens.RefreshToken);
         var newStored = await db.RefreshTokens.FirstAsync(rt => rt.TokenHash == newHash);
@@ -194,15 +224,29 @@ public class AuthController(
         return NoContent();
     }
 
-    private async Task<TokenResponse> IssueTokensAsync(ApplicationUser user)
+    /// Resolves the requested client application, falling back to the default one when
+    /// the caller does not name it.
+    private async Task<ClientApplication?> ResolveApplicationAsync(string? clientId) =>
+        await clientApplications.FindByClientIdAsync(
+            string.IsNullOrWhiteSpace(clientId) ? DataSeeder.DefaultClientId : clientId);
+
+    private async Task<TokenResponse> IssueTokensAsync(ApplicationUser user, ClientApplication app)
     {
-        var roles = await userManager.GetRolesAsync(user);
-        var (accessToken, expiresAtUtc) = tokenService.GenerateAccessToken(user, roles);
+        // Only the roles the user holds in this application travel in the token, stripped
+        // of the "clientId:" qualifier they are stored under.
+        var prefix = app.ClientId + ":";
+        var roles = (await userManager.GetRolesAsync(user))
+            .Where(r => r.StartsWith(prefix, StringComparison.Ordinal))
+            .Select(r => r[prefix.Length..])
+            .ToList();
+
+        var (accessToken, expiresAtUtc) = tokenService.GenerateAccessToken(user, app, roles);
         var refreshToken = tokenService.GenerateRefreshToken();
 
         db.RefreshTokens.Add(new RefreshToken
         {
             UserId = user.Id,
+            ClientApplicationId = app.Id,
             TokenHash = refreshToken.Hash,
             ExpiresAtUtc = refreshToken.ExpiresAtUtc,
         });

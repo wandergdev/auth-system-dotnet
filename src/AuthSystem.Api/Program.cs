@@ -14,6 +14,26 @@ builder.Services.Configure<JwtOptions>(builder.Configuration.GetSection(JwtOptio
 var jwtOptions = builder.Configuration.GetSection(JwtOptions.SectionName).Get<JwtOptions>()
     ?? throw new InvalidOperationException("Missing 'Jwt' configuration section.");
 
+// The signing key never lives in a committed file: it comes from user-secrets in
+// development and from the Jwt__Secret environment variable everywhere else. Fail
+// fast and loudly instead of falling back to anything insecure.
+if (string.IsNullOrWhiteSpace(jwtOptions.Secret))
+{
+    throw new InvalidOperationException(
+        "Jwt:Secret is not configured. The API refuses to start without a signing key. " +
+        "Local development: run 'dotnet user-secrets set \"Jwt:Secret\" \"<key>\"' from src/AuthSystem.Api. " +
+        "Deployment: set the Jwt__Secret environment variable. " +
+        "Generate a key with: openssl rand -base64 48");
+}
+
+var signingKeyBytes = Encoding.UTF8.GetBytes(jwtOptions.Secret);
+if (signingKeyBytes.Length < 32)
+{
+    throw new InvalidOperationException(
+        $"Jwt:Secret is too short: {signingKeyBytes.Length} bytes. HS256 requires a key of at least " +
+        "32 bytes (256 bits). Generate one with: openssl rand -base64 48");
+}
+
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlite(builder.Configuration.GetConnectionString("Default")));
 
@@ -44,7 +64,7 @@ builder.Services
             ValidateAudience = true,
             ValidAudience = jwtOptions.Audience,
             ValidateIssuerSigningKey = true,
-            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtOptions.Secret)),
+            IssuerSigningKey = new SymmetricSecurityKey(signingKeyBytes),
             ValidateLifetime = true,
             ClockSkew = TimeSpan.FromSeconds(30),
         };

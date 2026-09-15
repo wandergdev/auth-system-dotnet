@@ -19,6 +19,7 @@ public class ClientApplicationService(
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
 
     private volatile IReadOnlyCollection<string> _audiences = [];
+    private volatile string? _systemAudience;
     private DateTime _loadedAtUtc = DateTime.MinValue;
 
     public async Task<ClientApplication?> FindByClientIdAsync(string clientId, CancellationToken ct = default)
@@ -30,6 +31,8 @@ public class ClientApplicationService(
             .AsNoTracking()
             .FirstOrDefaultAsync(a => a.ClientId == clientId && a.IsActive, ct);
     }
+
+    public string? GetSystemAudience() => _systemAudience;
 
     public IReadOnlyCollection<string> GetActiveAudiences()
     {
@@ -51,13 +54,15 @@ public class ClientApplicationService(
             using var scope = scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-            var audiences = await db.ClientApplications
+            var applications = await db.ClientApplications
                 .AsNoTracking()
                 .Where(a => a.IsActive)
-                .Select(a => a.Audience)
+                .Select(a => new { a.ClientId, a.Audience })
                 .ToListAsync(ct);
 
-            _audiences = audiences.AsReadOnly();
+            _audiences = applications.Select(a => a.Audience).ToList().AsReadOnly();
+            _systemAudience = applications
+                .FirstOrDefault(a => a.ClientId == Data.DataSeeder.DefaultClientId)?.Audience;
             _loadedAtUtc = DateTime.UtcNow;
         }
         finally

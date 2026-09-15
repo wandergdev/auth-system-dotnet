@@ -11,6 +11,11 @@ public interface IClientApplicationService
     /// async path, and must never become a database round trip per request.
     IReadOnlyCollection<string> GetActiveAudiences();
 
+    /// Audience of the default application, which is the one that governs the service
+    /// itself. Holding Admin in any other application must not grant administration of
+    /// the registry.
+    string? GetSystemAudience();
+
     /// Reloads the snapshot. Called once at startup and whenever an application is
     /// registered or changed.
     Task RefreshAsync(CancellationToken ct = default);

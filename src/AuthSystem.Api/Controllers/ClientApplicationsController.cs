@@ -1,3 +1,4 @@
+using AuthSystem.Api.Authorization;
 using AuthSystem.Api.Data;
 using AuthSystem.Api.Dtos;
 using AuthSystem.Api.Models;
@@ -9,12 +10,14 @@ using Microsoft.EntityFrameworkCore;
 
 namespace AuthSystem.Api.Controllers;
 
-/// Registry of consuming applications. Restricted to administrators of the default
-/// application: registering an app decides which audiences this service will mint and
-/// accept, so it is not something an ordinary user may do.
+/// Registry of consuming applications.
+///
+/// Guarded by the SystemAdmin policy, not by the Admin role alone: roles belong to an
+/// application, so an Admin of a consumer app must not be able to register audiences or
+/// deactivate somebody else's application.
 [ApiController]
 [Route("api/applications")]
-[Authorize(Roles = "Admin")]
+[Authorize(Policy = SystemAdminRequirement.PolicyName)]
 public class ClientApplicationsController(
     AppDbContext db,
     RoleManager<ApplicationRole> roleManager,

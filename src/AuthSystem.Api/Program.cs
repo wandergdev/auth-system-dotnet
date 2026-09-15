@@ -1,8 +1,10 @@
+using AuthSystem.Api.Authorization;
 using AuthSystem.Api.Data;
 using AuthSystem.Api.Models;
 using AuthSystem.Api.Options;
 using AuthSystem.Api.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -76,7 +78,10 @@ builder.Services
             && audiences.Any(a => registry.GetActiveAudiences().Contains(a, StringComparer.Ordinal));
     });
 
-builder.Services.AddAuthorization();
+builder.Services.AddAuthorization(options =>
+    options.AddPolicy(SystemAdminRequirement.PolicyName, policy =>
+        policy.Requirements.Add(new SystemAdminRequirement())));
+builder.Services.AddSingleton<IAuthorizationHandler, SystemAdminHandler>();
 builder.Services.AddMemoryCache();
 builder.Services.AddScoped<ITokenService, TokenService>();
 // Scoped, not singleton: the challenge store now writes to the database, so every
